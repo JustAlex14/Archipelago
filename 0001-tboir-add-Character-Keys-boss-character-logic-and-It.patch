@@ -1,0 +1,322 @@
+From 91839f4a8ed468706f7e3136690170dedf83fc65 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 26 Sep 2026 18:38:09 +0200
+Subject: [PATCH] tboir: add Character Keys, boss character logic and Item Keys
+
+For the AP Character Lock companion mod:
+- character_keys: adds Character Key 1..N (up to 60) as progression items.
+- boss_character_keys: bosses that only count with some characters; their
+  reward checks and goal require one of the matching Character Keys in
+  logic, so a key can never end up behind its own boss.
+- item_keys: collectibles locked until "Item Key: <name>" is received.
+
+New items are appended at the end of the item list, so existing item IDs
+are unchanged. Options are also sent in slot data for the mod.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01S4vVFS41MFpEmY7SpkmkRY
+---
+ worlds/tboir/__init__.py                 | 42 ++++++++++++++--
+ worlds/tboir/archipelago.json            | 12 +++--
+ worlds/tboir/items.py                    | 25 ++++++++++
+ worlds/tboir/options.py                  | 43 ++++++++++++++++-
+ worlds/tboir/test/test_character_lock.py | 61 ++++++++++++++++++++++++
+ 5 files changed, 176 insertions(+), 7 deletions(-)
+ create mode 100644 worlds/tboir/test/test_character_lock.py
+
+diff --git a/worlds/tboir/__init__.py b/worlds/tboir/__init__.py
+index bcd926a..dc16ffa 100644
+--- a/worlds/tboir/__init__.py
++++ b/worlds/tboir/__init__.py
+@@ -2,7 +2,7 @@ import json
+ import pkgutil
+ from typing import Any
+ from BaseClasses import CollectionState, Item, ItemClassification, Location, Region, Tutorial
+-from Options import Option
++from Options import Option, OptionError
+ from rule_builder.options import OptionFilter
+ from rule_builder.rules import And, CanReachRegion, Has, Or, Rule, True_
+ import settings
+@@ -80,8 +80,8 @@ class TboiWorld(World):
+ 
+     def create_item(self, item: str) -> TboiItem:
+         classification = \
+-                ItemClassification.progression if item.endswith('Unlock') else \
+-                ItemClassification.useful if item.startswith('1-UP') or item.startswith('Progressive') or item.startswith('Permanent') or item.startswith('Angel Deal') or item.startswith('Devil Deal') or item.startswith('Planetarium') else \
++                ItemClassification.progression if item.endswith('Unlock') or item.startswith('Character Key') else \
++                ItemClassification.useful if item.startswith('Item Key: ') or item.startswith('1-UP') or item.startswith('Progressive') or item.startswith('Permanent') or item.startswith('Angel Deal') or item.startswith('Devil Deal') or item.startswith('Planetarium') else \
+                 ItemClassification.trap if item.endswith('Trap') else \
+                 ItemClassification.filler
+         return TboiItem(item, classification, self.item_name_to_id[item], self.player)
+@@ -236,6 +236,14 @@ class TboiWorld(World):
+             self.multiworld.itempool.append(self.create_item(f'{name} Unlock'))
+             own_items += 1
+         
++        for i in range(1, self.options.character_keys.value + 1):
++            self.multiworld.itempool.append(self.create_item(f'Character Key {i}'))
++            own_items += 1
++
++        for name in sorted(self.options.item_keys.value):
++            self.multiworld.itempool.append(self.create_item(f'Item Key: {name}'))
++            own_items += 1
++
+         for _ in range(self.options.one_ups.value):
+             self.multiworld.itempool.append(self.create_item('1-UP'))
+             own_items += 1
+@@ -287,6 +295,20 @@ class TboiWorld(World):
+             goal_amount = goals
+ 
+         self.set_completion_rule(Has("Victory Condition", goal_amount))
++
++        # Bosses that only count with some characters (AP Character Lock): their checks and goal
++        # require one of the matching Character Keys, so no key ends up behind its own boss.
++        for boss, numbers in self.options.boss_character_keys.value.items():
++            keys = [Has(f'Character Key {n}') for n in numbers]
++            rule = keys[0] if len(keys) == 1 else Or(*keys)
++            names = [f'{boss} Reward #{i + 1}' for i in range(data["boss_rewards"][boss]["amount"])]
++            names.append(f'Defeat {boss}')
++            for name in names:
++                try:
++                    location = self.multiworld.get_location(name, self.player)
++                except KeyError:
++                    continue
++                self.set_rule(location, rule)
+         #self.multiworld.completion_condition[self.player] = lambda state: state.has("Victory Condition", self.player, goal_amount)
+         #self.multiworld.completion_condition[self.player] = self.has_location_lambda("Mega Satan - Boss Room")
+         
+@@ -316,6 +338,9 @@ class TboiWorld(World):
+                 "retain_one_ups_percentage",
+                 "exclude_items_as_rewards",
+                 "death_link",
++                "character_keys",
++                "boss_character_keys",
++                "item_keys",
+                 "goal_amount",
+                 "character_goals",
+                 "exclude_characters",
+@@ -343,6 +368,17 @@ class TboiWorld(World):
+     def generate_early(self) -> None:
+         self.goals = []
+ 
++        for boss, numbers in self.options.boss_character_keys.value.items():
++            if isinstance(numbers, int):
++                numbers = [numbers]
++                self.options.boss_character_keys.value[boss] = numbers
++            if not isinstance(numbers, list) or not numbers:
++                raise OptionError(f"boss_character_keys: {boss} needs a list of Character Key numbers, e.g. [34]")
++            for n in numbers:
++                if not isinstance(n, int) or n < 1 or n > self.options.character_keys.value:
++                    raise OptionError(f"boss_character_keys: {boss} uses Character Key {n}, but character_keys is "
++                                      f"{self.options.character_keys.value}. Raise character_keys or fix the number.")
++
+         re_gen_passthrough = getattr(self.multiworld, "re_gen_passthrough", {})
+         if re_gen_passthrough and self.game in re_gen_passthrough:
+             # Get the passed through slot data from the real generation
+diff --git a/worlds/tboir/archipelago.json b/worlds/tboir/archipelago.json
+index 115f659..9d7d432 100644
+--- a/worlds/tboir/archipelago.json
++++ b/worlds/tboir/archipelago.json
+@@ -2,10 +2,16 @@
+     "game": "The Binding of Isaac Repentance",
+     "world_version": "0.4.4",
+     "minimum_ap_version": "0.6.7",
+-    "authors": ["NaveTK"],
++    "authors": [
++        "NaveTK",
++        "Alex (fork Character Keys)"
++    ],
+     "igdb_id": 109241,
+     "license": "MIT",
+     "repo_url": "https://github.com/NaveTK/Archipelago",
+-    "flags": ["tracker_included", "supports_deathlink"],
++    "flags": [
++        "tracker_included",
++        "supports_deathlink"
++    ],
+     "ai_disclosure": "none"
+-}
++}
+\ No newline at end of file
+diff --git a/worlds/tboir/items.py b/worlds/tboir/items.py
+index 3cba05d..625e30b 100644
+--- a/worlds/tboir/items.py
++++ b/worlds/tboir/items.py
+@@ -1,5 +1,22 @@
+ from .game_data import data
+ 
++# Items added by this fork for the AP Character Lock companion mod.
++# Always appended at the END of the list so existing item IDs never change.
++CHARACTER_KEY_COUNT = 60
++CHARACTER_KEYS = [f'Character Key {i}' for i in range(1, CHARACTER_KEY_COUNT + 1)]
++
++# Collectibles that can be locked behind an "Item Key: <name>" (see the item_keys option).
++# The names are the in-game English names; the mod knows their collectible IDs.
++# Only append to this list: never reorder or remove entries (that would change item IDs).
++LOCKABLE_ITEMS = [
++    "20/20", "Brimstone", "C Section", "Chocolate Milk", "Cricket's Head", "Crown of Light",
++    "Death's Touch", "Dr. Fetus", "Epic Fetus", "Glitched Crown", "Godhead", "Haemolacria",
++    "Holy Mantle", "Incubus", "Ipecac", "Magic Mushroom", "Mom's Knife", "Polyphemus",
++    "Proptosis", "Revelation", "Rock Bottom", "Sacred Heart", "Sacred Orb", "Spirit Sword",
++    "Spoon Bender", "Stop Watch", "Tech X", "Tech.5", "Technology", "The Wafer", "Twisted Pair",
++]
++ITEM_KEYS = [f'Item Key: {name}' for name in LOCKABLE_ITEMS]
++
+ def item_list():
+     items = []
+ 
+@@ -9,6 +26,9 @@ def item_list():
+     for item in data['items']:
+         items.append(item)
+ 
++    items.extend(CHARACTER_KEYS)
++    items.extend(ITEM_KEYS)
++
+     return items
+ 
+ def item_group_list():
+@@ -27,6 +47,11 @@ def item_group_list():
+         if item.startswith("Permanent "):
+             add_to_item_group(item_name_groups, "Stat Ups", item)
+ 
++    for item in CHARACTER_KEYS:
++        add_to_item_group(item_name_groups, "Character Keys", item)
++    for item in ITEM_KEYS:
++        add_to_item_group(item_name_groups, "Item Keys", item)
++
+     return item_name_groups
+ 
+ def add_to_item_group(item_name_groups, group, item):
+diff --git a/worlds/tboir/options.py b/worlds/tboir/options.py
+index abf5161..8c4b660 100644
+--- a/worlds/tboir/options.py
++++ b/worlds/tboir/options.py
+@@ -1,6 +1,8 @@
+ from dataclasses import dataclass
+ 
+-from Options import Choice, DeathLink, DefaultOnToggle, OptionCounter, OptionSet, Range, PerGameCommonOptions, NamedRange, Toggle
++from Options import Choice, DeathLink, DefaultOnToggle, OptionCounter, OptionDict, OptionSet, Range, PerGameCommonOptions, NamedRange, Toggle
++from .game_data import data as _game_data
++from .items import LOCKABLE_ITEMS
+ 
+ 
+ 
+@@ -586,6 +588,42 @@ class StartOutNerfed(Range):
+     range_end = 5
+     default = 0
+ 
++class CharacterKeys(Range):
++    """
++    Adds "Character Key 1" to "Character Key X" to the item pool (one of each).
++    They do nothing by themselves: the companion mod "AP Character Lock" uses them to unlock characters
++    (vanilla or modded). Place them with item plando, or leave them to be shuffled into the multiworld.
++    With the mod's defaults, keys 1-33 are the vanilla characters (all but Isaac) and 34+ your modded ones.
++    """
++    display_name = "Character Keys"
++    range_start = 0
++    range_end = 60
++    default = 0
++
++class BossCharacterKeys(OptionDict):
++    """
++    Bosses that only count when beaten with specific characters, given as Character Key numbers.
++    Example (with the mod's defaults: 3 = Judas, 20 = Tainted Judas, 34 = Bael):
++      Mother: [34]
++      The Lamb: [3, 20]
++    The "<Boss> Reward #N" checks and the "Defeat <Boss>" goal then require one of those keys in logic,
++    so the generator never places a key behind a boss that needs it. Every number must be at most
++    character_keys. The AP Character Lock mod reads this option and enforces it in game.
++    """
++    display_name = "Boss Character Keys"
++    valid_keys = frozenset(_game_data["boss_rewards"].keys())
++    default = {}
++
++class ItemKeys(OptionSet):
++    """
++    Collectibles that are locked until you receive their "Item Key: <name>". Adds one Item Key per listed
++    collectible to the item pool. While locked, the AP Character Lock mod replaces that collectible with
++    another one from the same pool whenever the game would spawn it.
++    """
++    display_name = "Item Keys"
++    valid_keys = frozenset(LOCKABLE_ITEMS)
++    default = frozenset()
++
+ class DeathLinkSeverity(Choice):
+     """
+     If death link is enabled, this defines how punishing the death link is for you.
+@@ -642,3 +680,6 @@ class TboiOptions(PerGameCommonOptions):
+     hint_types_from_fortunes: HintTypesFromFortunes
+     death_link: DeathLink
+     death_link_severity: DeathLinkSeverity
++    character_keys: CharacterKeys
++    boss_character_keys: BossCharacterKeys
++    item_keys: ItemKeys
+diff --git a/worlds/tboir/test/test_character_lock.py b/worlds/tboir/test/test_character_lock.py
+new file mode 100644
+index 0000000..5c546f9
+--- /dev/null
++++ b/worlds/tboir/test/test_character_lock.py
+@@ -0,0 +1,61 @@
++from .bases import TboiTestBase
++from ..items import CHARACTER_KEYS, ITEM_KEYS, LOCKABLE_ITEMS
++
++
++class TestNoCharacterLockOptions(TboiTestBase):
++    """With the new options left at their defaults, nothing is added."""
++
++    def test_no_keys_in_pool(self) -> None:
++        names = self.item_names()
++        for key in CHARACTER_KEYS + ITEM_KEYS:
++            self.assertNotIn(key, names)
++
++
++class TestCharacterKeys(TboiTestBase):
++    options = {"character_keys": 34}
++
++    def test_keys_in_pool(self) -> None:
++        pool = [item.name for item in self.multiworld.itempool]
++        for i in range(1, 35):
++            self.assertEqual(pool.count(f"Character Key {i}"), 1)
++        self.assertNotIn("Character Key 35", pool)
++
++    def test_keys_are_progression(self) -> None:
++        self.assertTrue(self.world.create_item("Character Key 1").advancement)
++
++
++class TestItemKeys(TboiTestBase):
++    options = {"item_keys": {"Brimstone", "Sacred Heart"}}
++
++    def test_item_keys_in_pool(self) -> None:
++        names = self.item_names()
++        self.assertIn("Item Key: Brimstone", names)
++        self.assertIn("Item Key: Sacred Heart", names)
++        self.assertNotIn("Item Key: Godhead", names)
++
++    def test_every_lockable_item_has_a_key(self) -> None:
++        for name in LOCKABLE_ITEMS:
++            self.assertIn(f"Item Key: {name}", self.world.item_name_to_id)
++
++
++class TestBossCharacterKeys(TboiTestBase):
++    options = {
++        "goals": {"Mother", "Mom"},
++        "character_keys": 34,
++        "boss_character_keys": {"Mother": [34], "Mom": [3, 20]},
++    }
++
++    def test_mother_needs_key_34(self) -> None:
++        location = self.multiworld.get_location("Mother Reward #1", self.player)
++        state = self.multiworld.get_all_state(False)
++        self.assertTrue(location.can_reach(state))
++        state.remove(self.world.create_item("Character Key 34"))
++        self.assertFalse(location.can_reach(state))
++
++    def test_mom_needs_one_of_two_keys(self) -> None:
++        location = self.multiworld.get_location("Defeat Mom", self.player)
++        state = self.multiworld.get_all_state(False)
++        state.remove(self.world.create_item("Character Key 3"))
++        self.assertTrue(location.can_reach(state))
++        state.remove(self.world.create_item("Character Key 20"))
++        self.assertFalse(location.can_reach(state))
+-- 
+2.43.0
+
