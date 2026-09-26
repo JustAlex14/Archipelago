@@ -14,6 +14,7 @@ import ModuleUpdate
 from NetUtils import ClientStatus, HintStatus
 import settings
 from worlds.tboir import TboiSettings
+from worlds.tboir.gifting import GiftingManager
 ModuleUpdate.update()
 
 import Utils
@@ -105,6 +106,10 @@ class IsaacContext(SuperContext):
         super(IsaacContext, self).__init__(server_address, password)
         s = settings.get_settings()
         self.settings = s.tboir_options
+        self.gifting = GiftingManager(self)
+
+    def queue_mod_command(self, type: str, payload: any) -> None:
+        self.commands_to_be_sent.put(IsaacContext.Command(type=type, payload=payload))
 
     def resolve_paths(self):
         try:
@@ -165,6 +170,7 @@ class IsaacContext(SuperContext):
             self.scouted_locations = {}
             self.hintable_locations = {}
             self.stored_data = {}
+            self.gifting.reset()
 
     async def shutdown(self):
         await super(IsaacContext, self).shutdown()
@@ -235,6 +241,7 @@ class IsaacContext(SuperContext):
             if len(self.locations_scouted) == 0:
                 Utils.async_start(self.send_msgs([
                     {"cmd": "LocationScouts", "locations": [code for code in self.server_locations], "create_as_hint": False}]))
+            self.gifting.on_connected()
         if cmd in {"Retrieved"}:
             if f"isaac_{self.team}_{self.slot}_saveslot" in args["keys"]:
                 if self.stored_data[f"isaac_{self.team}_{self.slot}_saveslot"] is None:
@@ -255,9 +262,11 @@ class IsaacContext(SuperContext):
                     self.set_data(f"isaac_{self.team}_{self.slot}_session_id", str(uuid4().int))
             if f"_read_hints_{self.team}_{self.slot}" in args["keys"]:
                 self.update_hints()
+            self.gifting.on_data(args["keys"].keys())
         if cmd in {"SetReply"}:
             if f"_read_hints_{self.team}_{self.slot}" == args["key"]:
                 self.update_hints()
+            self.gifting.on_data([args["key"]])
         if cmd in {"ReceivedItems"}:
             start_index = args["index"]
             if start_index != len(self.items_received) and self.current_state == self.State.CONNECTED:
@@ -362,6 +371,12 @@ class IsaacContext(SuperContext):
                 }
             )
             self.commands_to_be_sent.put(resp)
+            self.gifting.push_targets(force=True)
+            self.gifting.deliver(force=True)
+        elif c.type == "SendGift":
+            self.gifting.send(c.payload)
+        elif c.type == "GiftsReceived":
+            self.gifting.ack(c.payload or [])
         elif c.type == "Set":
             self.set_data(f"isaac_{self.team}_{self.slot}_{c.payload['key']}", c.payload['data'])
             self.ui.tracker_tab.on_runinfo_update(self.stored_data[f"isaac_{self.team}_{self.slot}_run_info"])
@@ -387,8 +402,44 @@ class IsaacContext(SuperContext):
         else:
             pass
 
+    LOCK_INFO_KEY = "ap_character_lock"
+
+    def lock_info(self) -> dict | None:
+        """Received item counts by name, read by the AP Character Lock mod (also in the main menu)."""
+        if self.current_state != self.State.CONNECTED:
+            return None
+        counts: dict[str, int] = {}
+        for item in self.items_received:
+            name = self.item_names.lookup_in_game(item.item, self.game)
+            counts[name] = counts.get(name, 0) + 1
+        return {"items": counts, "item_keys": list(self.options.get("item_keys", []))}
+
+    def refresh_lock_info_in_file(self, data: dict) -> None:
+        """While Isaac is in the menus, the mod doesn't talk to the client, so the file keeps the client's last
+        answer. Updates the received items stored in it, so newly received keys unlock characters in the menu.
+        Only done when the mod hasn't written the file for a while, so its commands are never overwritten."""
+        info = self.lock_info()
+        if info is None or data.get(self.LOCK_INFO_KEY) == info:
+            return
+        path = self.save_data_path
+        try:
+            before = os.path.getmtime(path)
+            if time.time() - before < 1.5:
+                return
+            data[self.LOCK_INFO_KEY] = info
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(json.dumps(data))
+            if os.path.getmtime(path) != before:
+                os.remove(tmp)
+                return
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
     def poll(self):
         if not os.path.isfile(self.save_data_path): return
+        self.gifting.tick()
 
         try:
             data = json.loads(open(self.save_data_path).read())
@@ -400,7 +451,9 @@ class IsaacContext(SuperContext):
                 commands=[IsaacContext.Command(type=c["type"], payload=c["payload"]) for c in data["commands"]]
             )
 
-            if save_data.actor != "mod": return
+            if save_data.actor != "mod":
+                self.refresh_lock_info_in_file(data)
+                return
 
             for c in save_data.commands:
                 self.process_mod_command(c)
@@ -412,7 +465,11 @@ class IsaacContext(SuperContext):
                 commands=[self.commands_to_be_sent.get() for _ in range(self.commands_to_be_sent.qsize())]
             )
             with open(self.save_data_path, "w") as f:
-                dump = json.dumps(asdict(new_save_data))
+                content = asdict(new_save_data)
+                info = self.lock_info()
+                if info is not None:
+                    content[self.LOCK_INFO_KEY] = info
+                dump = json.dumps(content)
                 f.write(dump)
 
             if self.current_state == self.State.CONNECTED:

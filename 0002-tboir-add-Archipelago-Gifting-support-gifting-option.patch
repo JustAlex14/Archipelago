@@ -1,0 +1,444 @@
+From 9e7e65cd5c0cf4b28eabd5ca371ceae2776fec3e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 26 Sep 2026 20:02:10 +0200
+Subject: [PATCH 2/2] tboir: add Archipelago Gifting support (gifting option,
+ client giftbox)
+
+Adds the gifting option (on by default). The Isaac client opens a v3 giftbox,
+forwards received gifts to the game, removes them once the game confirms,
+and sends gifts built by the game (AP Character Lock's Gift Box) to players
+whose giftbox accepts them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01S4vVFS41MFpEmY7SpkmkRY
+---
+ worlds/tboir/__init__.py          |   1 +
+ worlds/tboir/client.py            |  16 ++
+ worlds/tboir/gifting.py           | 242 ++++++++++++++++++++++++++++++
+ worlds/tboir/options.py           |   9 ++
+ worlds/tboir/test/test_gifting.py |  56 +++++++
+ 5 files changed, 324 insertions(+)
+ create mode 100644 worlds/tboir/gifting.py
+ create mode 100644 worlds/tboir/test/test_gifting.py
+
+diff --git a/worlds/tboir/__init__.py b/worlds/tboir/__init__.py
+index dc16ffa..636a9e1 100644
+--- a/worlds/tboir/__init__.py
++++ b/worlds/tboir/__init__.py
+@@ -341,6 +341,7 @@ class TboiWorld(World):
+                 "character_keys",
+                 "boss_character_keys",
+                 "item_keys",
++                "gifting",
+                 "goal_amount",
+                 "character_goals",
+                 "exclude_characters",
+diff --git a/worlds/tboir/client.py b/worlds/tboir/client.py
+index ab0690d..aea7e47 100644
+--- a/worlds/tboir/client.py
++++ b/worlds/tboir/client.py
+@@ -14,6 +14,7 @@ import ModuleUpdate
+ from NetUtils import ClientStatus, HintStatus
+ import settings
+ from worlds.tboir import TboiSettings
++from worlds.tboir.gifting import GiftingManager
+ ModuleUpdate.update()
+ 
+ import Utils
+@@ -105,6 +106,10 @@ class IsaacContext(SuperContext):
+         super(IsaacContext, self).__init__(server_address, password)
+         s = settings.get_settings()
+         self.settings = s.tboir_options
++        self.gifting = GiftingManager(self)
++
++    def queue_mod_command(self, type: str, payload: any) -> None:
++        self.commands_to_be_sent.put(IsaacContext.Command(type=type, payload=payload))
+ 
+     def resolve_paths(self):
+         try:
+@@ -165,6 +170,7 @@ class IsaacContext(SuperContext):
+             self.scouted_locations = {}
+             self.hintable_locations = {}
+             self.stored_data = {}
++            self.gifting.reset()
+ 
+     async def shutdown(self):
+         await super(IsaacContext, self).shutdown()
+@@ -235,6 +241,7 @@ class IsaacContext(SuperContext):
+             if len(self.locations_scouted) == 0:
+                 Utils.async_start(self.send_msgs([
+                     {"cmd": "LocationScouts", "locations": [code for code in self.server_locations], "create_as_hint": False}]))
++            self.gifting.on_connected()
+         if cmd in {"Retrieved"}:
+             if f"isaac_{self.team}_{self.slot}_saveslot" in args["keys"]:
+                 if self.stored_data[f"isaac_{self.team}_{self.slot}_saveslot"] is None:
+@@ -255,9 +262,11 @@ class IsaacContext(SuperContext):
+                     self.set_data(f"isaac_{self.team}_{self.slot}_session_id", str(uuid4().int))
+             if f"_read_hints_{self.team}_{self.slot}" in args["keys"]:
+                 self.update_hints()
++            self.gifting.on_data(args["keys"].keys())
+         if cmd in {"SetReply"}:
+             if f"_read_hints_{self.team}_{self.slot}" == args["key"]:
+                 self.update_hints()
++            self.gifting.on_data([args["key"]])
+         if cmd in {"ReceivedItems"}:
+             start_index = args["index"]
+             if start_index != len(self.items_received) and self.current_state == self.State.CONNECTED:
+@@ -362,6 +371,12 @@ class IsaacContext(SuperContext):
+                 }
+             )
+             self.commands_to_be_sent.put(resp)
++            self.gifting.push_targets(force=True)
++            self.gifting.deliver(force=True)
++        elif c.type == "SendGift":
++            self.gifting.send(c.payload)
++        elif c.type == "GiftsReceived":
++            self.gifting.ack(c.payload or [])
+         elif c.type == "Set":
+             self.set_data(f"isaac_{self.team}_{self.slot}_{c.payload['key']}", c.payload['data'])
+             self.ui.tracker_tab.on_runinfo_update(self.stored_data[f"isaac_{self.team}_{self.slot}_run_info"])
+@@ -389,6 +404,7 @@ class IsaacContext(SuperContext):
+ 
+     def poll(self):
+         if not os.path.isfile(self.save_data_path): return
++        self.gifting.tick()
+ 
+         try:
+             data = json.loads(open(self.save_data_path).read())
+diff --git a/worlds/tboir/gifting.py b/worlds/tboir/gifting.py
+new file mode 100644
+index 0000000..e9e9d29
+--- /dev/null
++++ b/worlds/tboir/gifting.py
+@@ -0,0 +1,242 @@
++"""Archipelago Gifting (data version 3) for the Isaac client.
++
++Used by the AP Character Lock companion mod:
++- registers this slot's giftbox in the team's motherbox;
++- forwards gifts received in the giftbox to the game ("ReceiveGifts") and removes them from the
++  server once the game confirms it applied them ("GiftsReceived"), so a gift is never lost;
++- sends gifts built by the game ("SendGift") to other players whose giftbox accepts them;
++- tells the game which players can currently receive gifts ("GiftTargets").
++
++Spec: https://github.com/agilbert1412/Archipelago.Gifting.Net/blob/main/Documentation/Gifting%20API.md
++"""
++from __future__ import annotations
++
++import time
++import typing
++from uuid import uuid4
++
++if typing.TYPE_CHECKING:
++    from .client import IsaacContext
++
++GIFT_DATA_VERSION = 3
++# Traits this game understands when receiving (used to fill desired_traits)
++ACCEPTED_TRAITS = [
++    "Damage", "Weapon", "Bomb", "Fire", "Metal", "Ore",
++    "Mana", "Energy", "Drink", "Ice",
++    "Speed", "Animal",
++    "Light", "Tool", "Wood", "Stone",
++    "Seed", "Fish", "Grass", "Fruit", "Vegetable", "Egg", "Currency", "Resource", "Material",
++    "Heal", "Life", "Food", "Meat", "Cure", "Armor", "Buff", "Consumable", "Key",
++]
++RESEND_AFTER_SECONDS = 10.0
++
++
++def _get(d: dict, *names, default=None):
++    """Reads a field in snake_case (v3) or PascalCase (v1/v2)."""
++    for name in names:
++        if name in d:
++            return d[name]
++    return default
++
++
++def normalize_gift(gift_id: str, raw: dict) -> dict | None:
++    if not isinstance(raw, dict):
++        return None
++    traits = []
++    for t in _get(raw, "traits", "Traits", default=[]) or []:
++        if not isinstance(t, dict):
++            continue
++        name = _get(t, "trait", "Trait")
++        if not isinstance(name, str):
++            continue
++        traits.append({
++            "trait": name,
++            "quality": float(_get(t, "quality", "Quality", default=1.0) or 1.0),
++            "duration": float(_get(t, "duration", "Duration", default=1.0) or 1.0),
++        })
++    try:
++        amount = int(_get(raw, "amount", "Amount", default=1) or 1)
++    except (TypeError, ValueError):
++        amount = 1
++    return {
++        "id": str(_get(raw, "id", "ID", default=gift_id)),
++        "item_name": str(_get(raw, "item_name", "ItemName", default="Gift")),
++        "amount": max(1, amount),
++        "traits": traits,
++        "sender_slot": _get(raw, "sender_slot", "SenderSlot", default=0),
++        "sender_team": _get(raw, "sender_team", "SenderTeam", default=0),
++        "is_refund": bool(_get(raw, "is_refund", "IsRefund", default=False)),
++    }
++
++
++class GiftingManager:
++    def __init__(self, ctx: "IsaacContext"):
++        self.ctx = ctx
++        self.reset()
++
++    def reset(self) -> None:
++        self.delivered: dict[str, float] = {}   # gift id -> time sent to the game (not confirmed yet)
++        self.acked: set[str] = set()
++        self.last_targets: list | None = None
++        self.active = False
++
++    # ------------------------------------------------------------------ keys
++    @property
++    def motherbox_key(self) -> str:
++        return f"GiftBoxes;{self.ctx.team}"
++
++    def giftbox_key(self, slot: int | None = None) -> str:
++        return f"GiftBox;{self.ctx.team};{self.ctx.slot if slot is None else slot}"
++
++    def enabled(self) -> bool:
++        return bool(self.ctx.options.get("gifting", True))
++
++    # ------------------------------------------------------------------ connection
++    def on_connected(self) -> None:
++        self.reset()
++        if not self.enabled():
++            return
++        self.active = True
++        entry = {
++            str(self.ctx.slot): {
++                "is_open": True,
++                "accepts_any_gift": True,
++                "desired_traits": ACCEPTED_TRAITS,
++                "minimum_gift_data_version": GIFT_DATA_VERSION,
++                "maximum_gift_data_version": GIFT_DATA_VERSION,
++            }
++        }
++        self._send([
++            {"cmd": "Set", "key": self.motherbox_key, "default": {}, "want_reply": False,
++             "operations": [{"operation": "default", "value": {}}, {"operation": "update", "value": entry}]},
++            {"cmd": "Set", "key": self.giftbox_key(), "default": {}, "want_reply": False,
++             "operations": [{"operation": "default", "value": {}}]},
++        ])
++        self.ctx.set_notify(self.motherbox_key, self.giftbox_key())
++
++    def on_data(self, keys: typing.Iterable[str]) -> None:
++        if not self.active:
++            return
++        keys = set(keys)
++        if self.giftbox_key() in keys:
++            self.deliver()
++        if self.motherbox_key in keys:
++            self.push_targets()
++
++    # ------------------------------------------------------------------ receiving
++    def pending_gifts(self) -> dict:
++        box = self.ctx.stored_data.get(self.giftbox_key()) or {}
++        return {gid: g for gid, g in box.items() if gid not in self.acked} if isinstance(box, dict) else {}
++
++    def deliver(self, force: bool = False) -> None:
++        """Sends the gifts waiting in our giftbox to the game (again if not confirmed in time)."""
++        if not self.active or self.ctx.current_state != self.ctx.State.CONNECTED:
++            return
++        now = time.monotonic()
++        gifts = []
++        for gid, raw in self.pending_gifts().items():
++            sent = self.delivered.get(gid)
++            if force or sent is None or now - sent > RESEND_AFTER_SECONDS:
++                gift = normalize_gift(gid, raw)
++                if gift is None:
++                    self.ack([gid])          # unreadable: remove it so it doesn't block the box
++                    continue
++                gift["sender_name"] = self.ctx.player_names.get(gift["sender_slot"], "Someone")
++                gifts.append(gift)
++                self.delivered[gid] = now
++        if gifts:
++            self.ctx.queue_mod_command("ReceiveGifts", gifts)
++
++    def ack(self, gift_ids: list) -> None:
++        """The game applied these gifts: remove them from our giftbox on the server."""
++        ops = []
++        for gid in gift_ids:
++            gid = str(gid)
++            if gid in self.acked:
++                continue
++            self.acked.add(gid)
++            self.delivered.pop(gid, None)
++            ops.append({"operation": "pop", "value": gid})
++        if ops:
++            self._send([{"cmd": "Set", "key": self.giftbox_key(), "default": {}, "want_reply": False,
++                         "operations": ops}])
++
++    # ------------------------------------------------------------------ sending
++    def targets(self) -> list[dict]:
++        motherbox = self.ctx.stored_data.get(self.motherbox_key) or {}
++        result = []
++        if not isinstance(motherbox, dict):
++            return result
++        for slot_str, meta in motherbox.items():
++            try:
++                slot = int(slot_str)
++            except ValueError:
++                continue
++            if slot == self.ctx.slot or not isinstance(meta, dict):
++                continue
++            if not _get(meta, "is_open", "IsOpen", default=False):
++                continue
++            low = _get(meta, "minimum_gift_data_version", "MinimumGiftDataVersion", default=1)
++            high = _get(meta, "maximum_gift_data_version", "MaximumGiftDataVersion", default=1)
++            if not (low <= GIFT_DATA_VERSION <= high):
++                continue
++            accepts_any = _get(meta, "accepts_any_gift", "AcceptsAnyGift", default=False)
++            desired = set(_get(meta, "desired_traits", "DesiredTraits", default=[]) or [])
++            if not accepts_any and not ({"Currency", "Resource"} & desired):
++                continue
++            slot_info = self.ctx.slot_info.get(slot)
++            result.append({
++                "slot": slot,
++                "name": self.ctx.player_names.get(slot, f"Player {slot}"),
++                "game": slot_info.game if slot_info else "?",
++            })
++        return sorted(result, key=lambda t: t["slot"])
++
++    def push_targets(self, force: bool = False) -> None:
++        if self.ctx.current_state != self.ctx.State.CONNECTED:
++            return
++        targets = self.targets()
++        if force or targets != self.last_targets:
++            self.last_targets = targets
++            self.ctx.queue_mod_command("GiftTargets", targets)
++
++    def send(self, payload: dict) -> None:
++        """Builds and sends a gift requested by the game."""
++        if not self.active or not isinstance(payload, dict):
++            return
++        receiver = payload.get("receiver_slot")
++        allowed = {t["slot"] for t in self.targets()}
++        if receiver not in allowed:
++            self.ctx.queue_mod_command("GiftResult", {"ok": False, "request": payload.get("request")})
++            return
++        gift_id = str(uuid4())
++        gift = {
++            "id": gift_id,
++            "item_name": str(payload.get("item_name", "Coin")),
++            "amount": max(1, int(payload.get("amount", 1))),
++            "item_value": int(payload.get("item_value", 0)),
++            "traits": [{"trait": str(t.get("trait")), "quality": float(t.get("quality", 1.0)),
++                        "duration": float(t.get("duration", 1.0))}
++                       for t in payload.get("traits", []) if isinstance(t, dict) and t.get("trait")],
++            "sender_slot": self.ctx.slot,
++            "receiver_slot": receiver,
++            "sender_team": self.ctx.team,
++            "receiver_team": self.ctx.team,
++            "is_refund": False,
++        }
++        self._send([{"cmd": "Set", "key": self.giftbox_key(receiver), "default": {}, "want_reply": False,
++                     "operations": [{"operation": "default", "value": {}},
++                                    {"operation": "update", "value": {gift_id: gift}}]}])
++        name = self.ctx.player_names.get(receiver, f"Player {receiver}")
++        self.ctx.queue_mod_command("GiftResult", {"ok": True, "request": payload.get("request"),
++                                                  "receiver_name": name})
++
++    # ------------------------------------------------------------------ helpers
++    def tick(self) -> None:
++        if self.active:
++            self.deliver()
++            self.push_targets()
++
++    def _send(self, msgs: list) -> None:
++        import Utils
++        Utils.async_start(self.ctx.send_msgs(msgs))
+diff --git a/worlds/tboir/options.py b/worlds/tboir/options.py
+index 8c4b660..d1dacf0 100644
+--- a/worlds/tboir/options.py
++++ b/worlds/tboir/options.py
+@@ -624,6 +624,14 @@ class ItemKeys(OptionSet):
+     valid_keys = frozenset(LOCKABLE_ITEMS)
+     default = frozenset()
+ 
++class Gifting(DefaultOnToggle):
++    """
++    Opens this slot's giftbox for the Archipelago Gifting system (needs the AP Character Lock mod).
++    Received gifts become small permanent stat bonuses, and the Gift Box active item sends coins
++    to other players whose game supports gifting (for example Stardew Valley).
++    """
++    display_name = "Gifting"
++
+ class DeathLinkSeverity(Choice):
+     """
+     If death link is enabled, this defines how punishing the death link is for you.
+@@ -683,3 +691,4 @@ class TboiOptions(PerGameCommonOptions):
+     character_keys: CharacterKeys
+     boss_character_keys: BossCharacterKeys
+     item_keys: ItemKeys
++    gifting: Gifting
+diff --git a/worlds/tboir/test/test_gifting.py b/worlds/tboir/test/test_gifting.py
+new file mode 100644
+index 0000000..0864254
+--- /dev/null
++++ b/worlds/tboir/test/test_gifting.py
+@@ -0,0 +1,56 @@
++import unittest
++from enum import Enum
++from types import SimpleNamespace
++
++from ..gifting import GiftingManager, normalize_gift
++from .bases import TboiTestBase
++
++
++class TestNormalizeGift(unittest.TestCase):
++    def test_v3_gift(self):
++        gift = normalize_gift("g1", {"id": "g1", "item_name": "Coffee", "amount": 2,
++                                     "traits": [{"trait": "Speed", "quality": 1.5}],
++                                     "sender_slot": 2, "is_refund": False})
++        self.assertEqual(gift["item_name"], "Coffee")
++        self.assertEqual(gift["amount"], 2)
++        self.assertEqual(gift["traits"][0], {"trait": "Speed", "quality": 1.5, "duration": 1.0})
++        self.assertEqual(gift["sender_slot"], 2)
++
++    def test_v2_gift(self):
++        gift = normalize_gift("g2", {"ID": "g2", "ItemName": "Iron Bar", "Amount": 5,
++                                     "Traits": [{"Trait": "Metal", "Quality": 1}], "SenderSlot": 3,
++                                     "IsRefund": True})
++        self.assertEqual((gift["id"], gift["item_name"], gift["amount"]), ("g2", "Iron Bar", 5))
++        self.assertEqual(gift["traits"][0]["trait"], "Metal")
++        self.assertTrue(gift["is_refund"])
++
++    def test_bad_gift(self):
++        self.assertIsNone(normalize_gift("x", "not a dict"))
++        self.assertEqual(normalize_gift("x", {"amount": "?"})["amount"], 1)
++
++
++class TestTargets(unittest.TestCase):
++    def make(self, motherbox):
++        class State(Enum):
++            CONNECTED = 1
++        ctx = SimpleNamespace(team=0, slot=1, options={"gifting": 1}, State=State,
++                              current_state=State.CONNECTED,
++                              player_names={1: "Alex", 2: "Lucas", 3: "Marie", 4: "Old"},
++                              slot_info={2: SimpleNamespace(game="Stardew Valley")},
++                              stored_data={"GiftBoxes;0": motherbox})
++        return GiftingManager(ctx)
++
++    def test_targets(self):
++        gm = self.make({
++            "1": {"is_open": True, "accepts_any_gift": True, "minimum_gift_data_version": 3, "maximum_gift_data_version": 3},
++            "2": {"is_open": True, "accepts_any_gift": True, "minimum_gift_data_version": 2, "maximum_gift_data_version": 3},
++            "3": {"is_open": True, "accepts_any_gift": False, "desired_traits": ["Fish"],
++                  "minimum_gift_data_version": 3, "maximum_gift_data_version": 3},
++            "4": {"IsOpen": True, "AcceptsAnyGift": True, "MinimumGiftDataVersion": 1, "MaximumGiftDataVersion": 2},
++        })
++        self.assertEqual(gm.targets(), [{"slot": 2, "name": "Lucas", "game": "Stardew Valley"}])
++
++
++class TestGiftingOption(TboiTestBase):
++    def test_slot_data(self):
++        self.assertIn("gifting", self.world.fill_slot_data()["options"])
+-- 
+2.43.0
+

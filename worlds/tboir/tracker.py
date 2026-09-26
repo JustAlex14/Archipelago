@@ -13,6 +13,7 @@ from kivy.uix.floatlayout import FloatLayout
 
 from worlds.tboir.client import IsaacContext
 from .game_data import data
+from . import lock_tracker
 
 class TrackerLayout(FloatLayout):
     ctx: IsaacContext
@@ -79,6 +80,7 @@ class TrackerLayout(FloatLayout):
         self.locations = {}
         self.goals = {}
         self.ctx = ctx
+        self.lock_counts = lock_tracker.received_counts(ctx)
 
         for locid in self.ctx.server_locations:
             location_name = self.ctx.location_names.lookup_in_slot(locid, self.ctx.slot)
@@ -123,6 +125,8 @@ class TrackerLayout(FloatLayout):
                        (room["type"] == "error_room" and self.ctx.options["error_room"] == 3)):
                         rule = data["rooms"][icon_name]["requires"]
             location_box = Location(location_name, rule, self, region, height=26, size_hint=(1, None), spacing=5)
+            if " Reward " in location_name:
+                location_box.boss = region_name   # boss_character_keys: needs one of the boss's characters
             icon = self.load_image(f'tracker/images/{icon_name}.png')
             icon.size = (24, 24)
             icon.texture.min_filter = 'nearest'
@@ -209,6 +213,8 @@ class TrackerLayout(FloatLayout):
         self.goals_box.height = goal_rows * 52
 
         self.box_layout.height += self.goals_box.height + 5
+
+        self.build_lock_sections()
 
         self.unlocks_label = Label(text="Unlocks", height=26, size_hint=(1, None), halign="left")
         self.unlocks_label.texture_update() 
@@ -332,16 +338,121 @@ class TrackerLayout(FloatLayout):
         for region in self.regions.values():
             region._update_color()
 
+    # ------------------------------------------------------------------ AP Character Lock
+    def _text_row(self, text, icon_name=None):
+        row = BoxLayout(height=24, size_hint=(1, None), spacing=5)
+        if icon_name:
+            try:
+                icon = self.load_image(f'tracker/images/{icon_name}.png')
+                icon.size = (22, 22)
+                icon.texture.min_filter = 'nearest'
+                icon.texture.mag_filter = 'nearest'
+                icon.size_hint = (None, None)
+                row.add_widget(icon)
+            except Exception:
+                pass
+        label = Label(text=text, valign="center", halign="left", size_hint=(1, 1), markup=True)
+        label.bind(size=label.setter('text_size'))
+        row.add_widget(label)
+        row.label = label
+        return row
+
+    def _section(self, title):
+        label = Label(text=title, height=26, size_hint=(1, None), halign="left", markup=True)
+        label.texture_update()
+        label.size = label.texture_size
+        self.box_layout.add_widget(label)
+        box = BoxLayout(size_hint=(1, None), height=0, orientation='vertical')
+        self.box_layout.add_widget(box)
+        return label, box
+
+    @staticmethod
+    def _colored(text, ok):
+        return f"[color={'00ff00' if ok else 'ff5555'}]{text}[/color]"
+
+    def build_lock_sections(self):
+        """Characters to unlock, bosses reserved for characters, and locked items (AP Character Lock)."""
+        self.character_rows, self.boss_rows_ui, self.item_rows = {}, {}, {}
+        self.characters_label = self.bosses_label = self.item_keys_label = None
+
+        characters = lock_tracker.character_rows(self.ctx)
+        if characters:
+            self.characters_label, box = self._section("Characters")
+            for number, name, unlocked in characters:
+                row = self._text_row(self._colored(name, unlocked), name.replace("???", "Blue Baby"))
+                self.character_rows[number] = row
+                box.add_widget(row)
+                box.height += 24
+            self.box_layout.height += self.characters_label.height + box.height + 10
+
+        bosses = lock_tracker.boss_rows(self.ctx)
+        if bosses:
+            self.bosses_label, box = self._section("Bosses reserved for characters")
+            for boss, names, ok in bosses:
+                row = self._text_row(self._colored(f"{boss}: {' or '.join(names)}", ok), f"{boss} Goal")
+                self.boss_rows_ui[boss] = row
+                box.add_widget(row)
+                box.height += 24
+            self.box_layout.height += self.bosses_label.height + box.height + 10
+
+        items = lock_tracker.item_key_rows(self.ctx)
+        if items:
+            self.item_keys_label, box = self._section("Locked items (Item Keys)")
+            for name, unlocked in items:
+                row = self._text_row(self._colored(name, unlocked))
+                self.item_rows[name] = row
+                box.add_widget(row)
+                box.height += 24
+            self.box_layout.height += self.item_keys_label.height + box.height + 10
+
+        self.update_lock_sections()
+
+    def update_lock_sections(self):
+        self.lock_counts = lock_tracker.received_counts(self.ctx)
+        characters = lock_tracker.character_rows(self.ctx)
+        for number, name, unlocked in characters:
+            if number in self.character_rows:
+                self.character_rows[number].label.text = self._colored(name, unlocked)
+        if self.characters_label is not None:
+            done = sum(1 for _, _, unlocked in characters if unlocked)
+            self.characters_label.text = f"Characters ({done} / {len(characters)} unlocked)"
+        for boss, names, ok in lock_tracker.boss_rows(self.ctx):
+            if boss in self.boss_rows_ui:
+                self.boss_rows_ui[boss].label.text = self._colored(f"{boss}: {' or '.join(names)}", ok)
+        items = lock_tracker.item_key_rows(self.ctx)
+        for name, unlocked in items:
+            if name in self.item_rows:
+                self.item_rows[name].label.text = self._colored(name, unlocked)
+        if self.item_keys_label is not None:
+            done = sum(1 for _, unlocked in items if unlocked)
+            self.item_keys_label.text = f"Locked items ({done} / {len(items)} unlocked)"
+        for label in (self.characters_label, self.item_keys_label):
+            if label is not None:
+                label.texture_update()
+                label.size = label.texture_size
+
+    def boss_ok(self, boss):
+        return lock_tracker.boss_ok(self.ctx, boss, self.lock_counts)
+
+    def boss_hint(self, boss):
+        for name, names, _ in lock_tracker.boss_rows(self.ctx):
+            if name == boss:
+                return f" (with {' or '.join(names)})"
+        return ""
+
     def on_item_update(self, items):
         refresh = False
         for item in items:
             name = self.ctx.item_names.lookup_in_slot(item.item, self.ctx.slot)
+            if lock_tracker.is_lock_item(name):
+                refresh = True
             if name.endswith('Unlock'):
                 area = name.replace(' Unlock', '')
                 if area in self.unlocks:
                     self.unlocks[area]._check()
                     refresh = True
         if refresh:
+            self.update_lock_sections()
             self.update_reachability("Menu", True)
             for region in self.regions.values():
                 region._update_color()
@@ -558,17 +669,20 @@ class Location(BoxLayout):
         self.checked = False
         self.region = region
         self.name = name
+        self.boss = None
 
     def reachable(self):
-        return self.region.reachable and self.tracker.evaluate_rule(self.rule)
+        return self.region.reachable and self.tracker.evaluate_rule(self.rule) and \
+            (self.boss is None or self.tracker.boss_ok(self.boss))
 
     def _update_color(self):
+        name = self.name + (self.tracker.boss_hint(self.boss) if self.boss else "")
         if self.checked:
-            self.label.text = f"[color=888888]{self.name}[/color]"
+            self.label.text = f"[color=888888]{name}[/color]"
         elif self.region.reachable and self.reachable():
-            self.label.text = f"[color=00ff00]{self.name}[/color]"
+            self.label.text = f"[color=00ff00]{name}[/color]"
         else:
-            self.label.text = f"[color=ff0000]{self.name}[/color]"
+            self.label.text = f"[color=ff0000]{name}[/color]"
         self.label.texture_update() 
         self.label.size = self.label.texture_size
         self.region.tooltip._recalc_size()

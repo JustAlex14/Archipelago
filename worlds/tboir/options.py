@@ -624,6 +624,14 @@ class ItemKeys(OptionSet):
     valid_keys = frozenset(LOCKABLE_ITEMS)
     default = frozenset()
 
+class Gifting(DefaultOnToggle):
+    """
+    Opens this slot's giftbox for the Archipelago Gifting system (needs the AP Character Lock mod).
+    Received gifts become small permanent stat bonuses, and the Gift Box active item sends coins
+    to other players whose game supports gifting (for example Stardew Valley).
+    """
+    display_name = "Gifting"
+
 class DeathLinkSeverity(Choice):
     """
     If death link is enabled, this defines how punishing the death link is for you.
@@ -683,3 +691,4 @@ class TboiOptions(PerGameCommonOptions):
     character_keys: CharacterKeys
     boss_character_keys: BossCharacterKeys
     item_keys: ItemKeys
+    gifting: Gifting

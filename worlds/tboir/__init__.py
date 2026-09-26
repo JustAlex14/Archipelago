@@ -9,7 +9,8 @@ import settings
 from worlds.LauncherComponents import Component, Type, launch_subprocess, icon_paths, components
 from worlds.generic.Rules import add_item_rule, add_rule
 from .locations import location_list, location_group_list
-from .items import item_list, item_group_list
+from .items import item_list, item_group_list, character_key, CHARACTER_KEYS
+CHARACTER_KEY_SET = frozenset(CHARACTER_KEYS)
 from .options import TboiOptions
 from worlds.AutoWorld import WebWorld, World
 from .game_data import data
@@ -80,7 +81,7 @@ class TboiWorld(World):
 
     def create_item(self, item: str) -> TboiItem:
         classification = \
-                ItemClassification.progression if item.endswith('Unlock') or item.startswith('Character Key') else \
+                ItemClassification.progression if item.endswith('Unlock') or item in CHARACTER_KEY_SET else \
                 ItemClassification.useful if item.startswith('Item Key: ') or item.startswith('1-UP') or item.startswith('Progressive') or item.startswith('Permanent') or item.startswith('Angel Deal') or item.startswith('Devil Deal') or item.startswith('Planetarium') else \
                 ItemClassification.trap if item.endswith('Trap') else \
                 ItemClassification.filler
@@ -237,7 +238,7 @@ class TboiWorld(World):
             own_items += 1
         
         for i in range(1, self.options.character_keys.value + 1):
-            self.multiworld.itempool.append(self.create_item(f'Character Key {i}'))
+            self.multiworld.itempool.append(self.create_item(character_key(i)))
             own_items += 1
 
         for name in sorted(self.options.item_keys.value):
@@ -299,7 +300,7 @@ class TboiWorld(World):
         # Bosses that only count with some characters (AP Character Lock): their checks and goal
         # require one of the matching Character Keys, so no key ends up behind its own boss.
         for boss, numbers in self.options.boss_character_keys.value.items():
-            keys = [Has(f'Character Key {n}') for n in numbers]
+            keys = [Has(character_key(n)) for n in numbers]
             rule = keys[0] if len(keys) == 1 else Or(*keys)
             names = [f'{boss} Reward #{i + 1}' for i in range(data["boss_rewards"][boss]["amount"])]
             names.append(f'Defeat {boss}')
@@ -341,6 +342,7 @@ class TboiWorld(World):
                 "character_keys",
                 "boss_character_keys",
                 "item_keys",
+                "gifting",
                 "goal_amount",
                 "character_goals",
                 "exclude_characters",

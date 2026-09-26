@@ -1,5 +1,6 @@
+import unittest
 from .bases import TboiTestBase
-from ..items import CHARACTER_KEYS, ITEM_KEYS, LOCKABLE_ITEMS
+from ..items import CHARACTER_KEYS, ITEM_KEYS, LOCKABLE_ITEMS, character_key
 
 
 class TestNoCharacterLockOptions(TboiTestBase):
@@ -17,11 +18,11 @@ class TestCharacterKeys(TboiTestBase):
     def test_keys_in_pool(self) -> None:
         pool = [item.name for item in self.multiworld.itempool]
         for i in range(1, 35):
-            self.assertEqual(pool.count(f"Character Key {i}"), 1)
-        self.assertNotIn("Character Key 35", pool)
+            self.assertEqual(pool.count(character_key(i)), 1)
+        self.assertNotIn(character_key(35), pool)
 
     def test_keys_are_progression(self) -> None:
-        self.assertTrue(self.world.create_item("Character Key 1").advancement)
+        self.assertTrue(self.world.create_item(character_key(1)).advancement)
 
 
 class TestItemKeys(TboiTestBase):
@@ -49,13 +50,25 @@ class TestBossCharacterKeys(TboiTestBase):
         location = self.multiworld.get_location("Mother Reward #1", self.player)
         state = self.multiworld.get_all_state(False)
         self.assertTrue(location.can_reach(state))
-        state.remove(self.world.create_item("Character Key 34"))
+        state.remove(self.world.create_item(character_key(34)))
         self.assertFalse(location.can_reach(state))
 
     def test_mom_needs_one_of_two_keys(self) -> None:
         location = self.multiworld.get_location("Defeat Mom", self.player)
         state = self.multiworld.get_all_state(False)
-        state.remove(self.world.create_item("Character Key 3"))
+        state.remove(self.world.create_item(character_key(3)))
         self.assertTrue(location.can_reach(state))
-        state.remove(self.world.create_item("Character Key 20"))
+        state.remove(self.world.create_item(character_key(20)))
         self.assertFalse(location.can_reach(state))
+
+
+class TestCharacterKeyNames(unittest.TestCase):
+    def test_names(self) -> None:
+        self.assertEqual(character_key(1), "Magdalene (Character Key 1)")
+        self.assertEqual(character_key(20), "Tainted Judas (Character Key 20)")
+        self.assertEqual(character_key(33), "Tainted Jacob (Character Key 33)")
+        self.assertEqual(len(set(CHARACTER_KEYS)), 60)
+
+    def test_number_group(self) -> None:
+        from .. import TboiWorld
+        self.assertEqual(TboiWorld.item_name_groups["Character Key 1"], {character_key(1)})

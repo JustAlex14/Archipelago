@@ -1,7 +1,8 @@
 From 91839f4a8ed468706f7e3136690170dedf83fc65 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Sat, 26 Sep 2026 18:38:09 +0200
-Subject: [PATCH] tboir: add Character Keys, boss character logic and Item Keys
+Subject: [PATCH 1/2] tboir: add Character Keys, boss character logic and Item
+ Keys
 
 For the AP Character Lock companion mod:
 - character_keys: adds Character Key 1..N (up to 60) as progression items.
