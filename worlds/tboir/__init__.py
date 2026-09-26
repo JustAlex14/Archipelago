@@ -2,7 +2,7 @@ import json
 import pkgutil
 from typing import Any
 from BaseClasses import CollectionState, Item, ItemClassification, Location, Region, Tutorial
-from Options import Option
+from Options import Option, OptionError
 from rule_builder.options import OptionFilter
 from rule_builder.rules import And, CanReachRegion, Has, Or, Rule, True_
 import settings
@@ -80,8 +80,8 @@ class TboiWorld(World):
 
     def create_item(self, item: str) -> TboiItem:
         classification = \
-                ItemClassification.progression if item.endswith('Unlock') else \
-                ItemClassification.useful if item.startswith('1-UP') or item.startswith('Progressive') or item.startswith('Permanent') or item.startswith('Angel Deal') or item.startswith('Devil Deal') or item.startswith('Planetarium') else \
+                ItemClassification.progression if item.endswith('Unlock') or item.startswith('Character Key') else \
+                ItemClassification.useful if item.startswith('Item Key: ') or item.startswith('1-UP') or item.startswith('Progressive') or item.startswith('Permanent') or item.startswith('Angel Deal') or item.startswith('Devil Deal') or item.startswith('Planetarium') else \
                 ItemClassification.trap if item.endswith('Trap') else \
                 ItemClassification.filler
         return TboiItem(item, classification, self.item_name_to_id[item], self.player)
@@ -236,6 +236,14 @@ class TboiWorld(World):
             self.multiworld.itempool.append(self.create_item(f'{name} Unlock'))
             own_items += 1
         
+        for i in range(1, self.options.character_keys.value + 1):
+            self.multiworld.itempool.append(self.create_item(f'Character Key {i}'))
+            own_items += 1
+
+        for name in sorted(self.options.item_keys.value):
+            self.multiworld.itempool.append(self.create_item(f'Item Key: {name}'))
+            own_items += 1
+
         for _ in range(self.options.one_ups.value):
             self.multiworld.itempool.append(self.create_item('1-UP'))
             own_items += 1
@@ -287,6 +295,20 @@ class TboiWorld(World):
             goal_amount = goals
 
         self.set_completion_rule(Has("Victory Condition", goal_amount))
+
+        # Bosses that only count with some characters (AP Character Lock): their checks and goal
+        # require one of the matching Character Keys, so no key ends up behind its own boss.
+        for boss, numbers in self.options.boss_character_keys.value.items():
+            keys = [Has(f'Character Key {n}') for n in numbers]
+            rule = keys[0] if len(keys) == 1 else Or(*keys)
+            names = [f'{boss} Reward #{i + 1}' for i in range(data["boss_rewards"][boss]["amount"])]
+            names.append(f'Defeat {boss}')
+            for name in names:
+                try:
+                    location = self.multiworld.get_location(name, self.player)
+                except KeyError:
+                    continue
+                self.set_rule(location, rule)
         #self.multiworld.completion_condition[self.player] = lambda state: state.has("Victory Condition", self.player, goal_amount)
         #self.multiworld.completion_condition[self.player] = self.has_location_lambda("Mega Satan - Boss Room")
         
@@ -316,6 +338,9 @@ class TboiWorld(World):
                 "retain_one_ups_percentage",
                 "exclude_items_as_rewards",
                 "death_link",
+                "character_keys",
+                "boss_character_keys",
+                "item_keys",
                 "goal_amount",
                 "character_goals",
                 "exclude_characters",
@@ -342,6 +367,17 @@ class TboiWorld(World):
     
     def generate_early(self) -> None:
         self.goals = []
+
+        for boss, numbers in self.options.boss_character_keys.value.items():
+            if isinstance(numbers, int):
+                numbers = [numbers]
+                self.options.boss_character_keys.value[boss] = numbers
+            if not isinstance(numbers, list) or not numbers:
+                raise OptionError(f"boss_character_keys: {boss} needs a list of Character Key numbers, e.g. [34]")
+            for n in numbers:
+                if not isinstance(n, int) or n < 1 or n > self.options.character_keys.value:
+                    raise OptionError(f"boss_character_keys: {boss} uses Character Key {n}, but character_keys is "
+                                      f"{self.options.character_keys.value}. Raise character_keys or fix the number.")
 
         re_gen_passthrough = getattr(self.multiworld, "re_gen_passthrough", {})
         if re_gen_passthrough and self.game in re_gen_passthrough:

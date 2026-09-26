@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 
-from Options import Choice, DeathLink, DefaultOnToggle, OptionCounter, OptionSet, Range, PerGameCommonOptions, NamedRange, Toggle
+from Options import Choice, DeathLink, DefaultOnToggle, OptionCounter, OptionDict, OptionSet, Range, PerGameCommonOptions, NamedRange, Toggle
+from .game_data import data as _game_data
+from .items import LOCKABLE_ITEMS
 
 
 
@@ -586,6 +588,42 @@ class StartOutNerfed(Range):
     range_end = 5
     default = 0
 
+class CharacterKeys(Range):
+    """
+    Adds "Character Key 1" to "Character Key X" to the item pool (one of each).
+    They do nothing by themselves: the companion mod "AP Character Lock" uses them to unlock characters
+    (vanilla or modded). Place them with item plando, or leave them to be shuffled into the multiworld.
+    With the mod's defaults, keys 1-33 are the vanilla characters (all but Isaac) and 34+ your modded ones.
+    """
+    display_name = "Character Keys"
+    range_start = 0
+    range_end = 60
+    default = 0
+
+class BossCharacterKeys(OptionDict):
+    """
+    Bosses that only count when beaten with specific characters, given as Character Key numbers.
+    Example (with the mod's defaults: 3 = Judas, 20 = Tainted Judas, 34 = Bael):
+      Mother: [34]
+      The Lamb: [3, 20]
+    The "<Boss> Reward #N" checks and the "Defeat <Boss>" goal then require one of those keys in logic,
+    so the generator never places a key behind a boss that needs it. Every number must be at most
+    character_keys. The AP Character Lock mod reads this option and enforces it in game.
+    """
+    display_name = "Boss Character Keys"
+    valid_keys = frozenset(_game_data["boss_rewards"].keys())
+    default = {}
+
+class ItemKeys(OptionSet):
+    """
+    Collectibles that are locked until you receive their "Item Key: <name>". Adds one Item Key per listed
+    collectible to the item pool. While locked, the AP Character Lock mod replaces that collectible with
+    another one from the same pool whenever the game would spawn it.
+    """
+    display_name = "Item Keys"
+    valid_keys = frozenset(LOCKABLE_ITEMS)
+    default = frozenset()
+
 class DeathLinkSeverity(Choice):
     """
     If death link is enabled, this defines how punishing the death link is for you.
@@ -642,3 +680,6 @@ class TboiOptions(PerGameCommonOptions):
     hint_types_from_fortunes: HintTypesFromFortunes
     death_link: DeathLink
     death_link_severity: DeathLinkSeverity
+    character_keys: CharacterKeys
+    boss_character_keys: BossCharacterKeys
+    item_keys: ItemKeys
